@@ -21,8 +21,7 @@ const TREE_INIT_BACKOFF: Duration = Duration::from_secs(5);
 const PROCESS_IDENTITIES_BACKOFF: Duration = Duration::from_secs(5);
 const FINALIZE_IDENTITIES_BACKOFF: Duration = Duration::from_secs(5);
 const QUEUE_MONITOR_BACKOFF: Duration = Duration::from_secs(5);
-const INSERT_IDENTITIES_BACKOFF: Duration = Duration::from_secs(5);
-const DELETE_IDENTITIES_BACKOFF: Duration = Duration::from_secs(5);
+const MODIFY_TREE_BACKOFF: Duration = Duration::from_secs(5);
 
 static PENDING_IDENTITIES: Lazy<Gauge> = Lazy::new(|| {
     register_gauge!("pending_identities", "Identities not submitted on-chain").unwrap()
@@ -153,44 +152,18 @@ impl TaskMonitor {
         );
         handles.push(monitor_txs_handle);
 
-        let pending_insertion_mutex = Arc::new(Mutex::new(()));
-
-        // Insert identities
+        // Modify tree
         let app = main_app.clone();
         let wake_up_notify = base_wake_up_notify.clone();
-        let insertion_mutex = pending_insertion_mutex.clone();
-        let insert_identities = move || {
-            self::tasks::insert_identities::insert_identities(
-                app.clone(),
-                insertion_mutex.clone(),
-                wake_up_notify.clone(),
-            )
-        };
+        let modify_tree =
+            move || tasks::modify_tree::modify_tree(app.clone(), wake_up_notify.clone());
 
-        let insert_identities_handle = crate::utils::spawn_with_backoff_cancel_on_shutdown(
-            insert_identities,
-            INSERT_IDENTITIES_BACKOFF,
+        let modify_tree_handle = crate::utils::spawn_with_backoff_cancel_on_shutdown(
+            modify_tree,
+            MODIFY_TREE_BACKOFF,
             shutdown.clone(),
         );
-        handles.push(insert_identities_handle);
-
-        // Delete identities
-        let app = main_app.clone();
-        let wake_up_notify = base_wake_up_notify.clone();
-        let delete_identities = move || {
-            self::tasks::delete_identities::delete_identities(
-                app.clone(),
-                pending_insertion_mutex.clone(),
-                wake_up_notify.clone(),
-            )
-        };
-
-        let delete_identities_handle = crate::utils::spawn_with_backoff_cancel_on_shutdown(
-            delete_identities,
-            DELETE_IDENTITIES_BACKOFF,
-            shutdown.clone(),
-        );
-        handles.push(delete_identities_handle);
+        handles.push(modify_tree_handle);
 
         tokio::spawn(Self::monitor_shutdown(handles, shutdown.clone()));
     }
