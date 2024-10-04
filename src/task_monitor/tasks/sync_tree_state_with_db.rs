@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use sqlx::{Postgres, Transaction};
+use tokio::sync::watch::Sender;
 use tokio::sync::Notify;
 use tokio::time::Duration;
 use tokio::{select, time};
@@ -15,7 +16,7 @@ use crate::task_monitor::App;
 pub async fn sync_tree_state_with_db(
     app: Arc<App>,
     sync_tree_notify: Arc<Notify>,
-    tree_synced_notify: Arc<Notify>,
+    mut tree_synced_tx: Sender<bool>,
 ) -> anyhow::Result<()> {
     tracing::info!("Awaiting for a clean slate");
     app.identity_processor.await_clean_slate().await?;
@@ -41,7 +42,9 @@ pub async fn sync_tree_state_with_db(
 
         retry_tx!(&app.database, tx, sync_tree(&mut tx, tree_state).await).await?;
 
-        tree_synced_notify.notify_one();
+        tracing::info!("TreeState synced with DB");
+
+        tree_synced_tx.send(true);
     }
 }
 

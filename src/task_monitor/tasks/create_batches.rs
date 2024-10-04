@@ -6,6 +6,7 @@ use ethers::prelude::U256;
 use ruint::Uint;
 use semaphore::merkle_tree::Proof;
 use semaphore::poseidon_tree::{Branch, PoseidonHash};
+use tokio::sync::watch::Receiver;
 use tokio::sync::Notify;
 use tokio::{select, time};
 use tracing::instrument;
@@ -30,7 +31,7 @@ pub async fn create_batches(
     app: Arc<App>,
     next_batch_notify: Arc<Notify>,
     sync_tree_notify: Arc<Notify>,
-    tree_synced_notify: Arc<Notify>,
+    mut tree_synced_rx: Receiver<bool>,
 ) -> anyhow::Result<()> {
     tracing::info!("Awaiting for a clean slate");
     app.identity_processor.await_clean_slate().await?;
@@ -43,7 +44,7 @@ pub async fn create_batches(
 
     // We start a timer and force it to perform one initial tick to avoid an
     // immediate trigger.
-    let mut timer = time::interval(app.config.app.batch_insertion_timeout);
+    let mut timer = time::interval(app.config.app.batch_insertion_timeout / 2);
     timer.tick().await;
 
     // When both futures are woken at once, the choice is made
@@ -65,7 +66,7 @@ pub async fn create_batches(
                 tracing::info!("Create batches woken due to timeout");
             }
 
-            () = tree_synced_notify.notified() => {
+            _ = tree_synced_rx.changed() => {
                 tracing::trace!("Create batches woken due tree synced event");
             },
 
@@ -177,9 +178,6 @@ pub async fn create_batches(
                 }
             }
         }
-
-        // We want to check if there's a full batch available immediately
-        check_next_batch_notify.notify_one();
     }
 }
 

@@ -4,9 +4,10 @@ use std::time::Duration;
 use anyhow::Context;
 use chrono::Utc;
 use sqlx::{Postgres, Transaction};
+use tokio::sync::watch::Receiver;
 use tokio::sync::Notify;
 use tokio::{select, time};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::app::App;
 use crate::database::query::DatabaseQuery as _;
@@ -21,7 +22,7 @@ use crate::retry_tx;
 pub async fn modify_tree(
     app: Arc<App>,
     sync_tree_notify: Arc<Notify>,
-    tree_synced_notify: Arc<Notify>,
+    mut tree_synced_rx: Receiver<bool>,
 ) -> anyhow::Result<()> {
     info!("Starting modify tree task.");
 
@@ -38,14 +39,27 @@ pub async fn modify_tree(
                 info!("Modify tree task woken due to timeout");
             }
 
-            () = tree_synced_notify.notified() => {
+            _ = tree_synced_rx.changed() => {
                 info!("Modify tree task woken due to tree synced event");
             },
         }
 
         let tree_state = app.tree_state()?;
 
-        let tree_modified = retry_tx!(&app.database, tx, {
+        let request_sync = retry_tx!(&app.database, tx, {
+            let latest_tree = tree_state.latest_tree();
+            let next_leaf_tree = latest_tree.next_leaf();
+            let next_leaf_db = tx.get_next_leaf_index().await?;
+
+            if next_leaf_db != next_leaf_db {
+                warn!(
+                    "Database and tree are out of sync. Next leaf index in tree is: {}, in \
+                     database: {}",
+                    next_leaf_tree, next_leaf_db
+                );
+                return Ok(true);
+            }
+
             do_modify_tree(
                 &mut tx,
                 batch_deletion_timeout,
@@ -56,10 +70,12 @@ pub async fn modify_tree(
         })
         .await?;
 
+        info!(request_sync, "Modify tree task finished");
+
         // It is very important to generate that event AFTER transaction is committed to
         // database. Otherwise, notified task may not see changes as transaction was not
         // committed yet.
-        if tree_modified {
+        if request_sync {
             sync_tree_notify.notify_one();
         }
     }
@@ -98,17 +114,16 @@ pub async fn should_run_deletion(
     tree_state: &TreeState,
     deletions: &[DeletionEntry],
 ) -> anyhow::Result<bool> {
-    let last_deletion_timestamp = tx.get_latest_deletion().await?.timestamp;
-
     if deletions.is_empty() {
         return Ok(false);
     }
 
     // If min batch size is not reached and batch deletion timeout not elapsed
-    if deletions.len() < min_batch_deletion_size
-        && Utc::now() - last_deletion_timestamp <= batch_deletion_timeout
-    {
-        return Ok(false);
+    if deletions.len() < min_batch_deletion_size {
+        let last_deletion_timestamp = tx.get_latest_deletion().await?.timestamp;
+        if Utc::now() - last_deletion_timestamp <= batch_deletion_timeout {
+            return Ok(false);
+        }
     }
 
     // Now also check if the deletion batch could potentially create a duplicate
@@ -120,7 +135,7 @@ pub async fn should_run_deletion(
         let indices_are_continuous = sorted_indices.windows(2).all(|w| w[1] == w[0] + 1);
 
         if indices_are_continuous && sorted_indices.last().unwrap() == &last_leaf_index {
-            tracing::warn!(
+            warn!(
                 "Deletion batch could potentially create a duplicate root batch. Deletion batch \
                  will be postponed."
             );
@@ -153,22 +168,12 @@ pub async fn run_insertions(
             .await?
             .is_some()
         {
-            tracing::warn!(?identity.commitment, "Duplicate identity");
+            warn!(?identity.commitment, "Duplicate identity");
             tx.remove_unprocessed_identity(&identity.commitment).await?;
         } else {
             filtered_identities.push(identity.commitment);
         }
     }
-
-    let next_leaf = latest_tree.next_leaf();
-
-    let next_db_index = tx.get_next_leaf_index().await?;
-
-    assert_eq!(
-        next_leaf, next_db_index,
-        "Database and tree are out of sync. Next leaf index in tree is: {next_leaf}, in database: \
-         {next_db_index}"
-    );
 
     let mut pre_root = &latest_tree.get_root();
     let data = latest_tree

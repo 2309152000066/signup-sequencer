@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use once_cell::sync::Lazy;
 use prometheus::{linear_buckets, register_gauge, register_histogram, Gauge, Histogram};
-use tokio::sync::{broadcast, mpsc, Mutex, Notify, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, instrument, warn};
 
@@ -15,7 +15,9 @@ use crate::shutdown::Shutdown;
 pub mod tasks;
 
 const TREE_INIT_BACKOFF: Duration = Duration::from_secs(5);
-const PROCESS_IDENTITIES_BACKOFF: Duration = Duration::from_secs(5);
+const CREATE_BATCHES_BACKOFF: Duration = Duration::from_secs(5);
+const PROCESS_BATCHES_BACKOFF: Duration = Duration::from_secs(5);
+const MONITOR_TXS_BACKOFF: Duration = Duration::from_secs(5);
 const FINALIZE_IDENTITIES_BACKOFF: Duration = Duration::from_secs(5);
 const QUEUE_MONITOR_BACKOFF: Duration = Duration::from_secs(5);
 const MODIFY_TREE_BACKOFF: Duration = Duration::from_secs(5);
@@ -115,9 +117,9 @@ impl TaskMonitor {
         // Immediately notify, so we can start processing if we have pending operations
         base_sync_tree_notify.notify_one();
 
-        let base_tree_synced_notify = Arc::new(Notify::new());
+        let (base_tree_synced_tx, base_tree_synced_rx) = watch::channel(false);
         // Immediately notify, so we can start processing if we have pending operations
-        base_tree_synced_notify.notify_one();
+        base_tree_synced_tx.send(true);
 
         let mut handles = Vec::new();
 
@@ -165,20 +167,20 @@ impl TaskMonitor {
         let app = self.app.clone();
         let next_batch_notify = base_next_batch_notify.clone();
         let sync_tree_notify = base_sync_tree_notify.clone();
-        let tree_synced_notify = base_tree_synced_notify.clone();
+        let tree_synced_rx = base_tree_synced_rx.clone();
 
         let create_batches = move || {
             tasks::create_batches::create_batches(
                 app.clone(),
                 next_batch_notify.clone(),
                 sync_tree_notify.clone(),
-                tree_synced_notify.clone(),
+                tree_synced_rx.clone(),
             )
         };
         let create_batches_handle = crate::utils::spawn_monitored_with_backoff(
             create_batches,
             shutdown_sender.clone(),
-            PROCESS_IDENTITIES_BACKOFF,
+            CREATE_BATCHES_BACKOFF,
             self.shutdown.clone(),
         );
         handles.push(create_batches_handle);
@@ -187,20 +189,20 @@ impl TaskMonitor {
         let app = self.app.clone();
         let next_batch_notify = base_next_batch_notify.clone();
 
-        let process_identities = move || {
+        let process_batches = move || {
             tasks::process_batches::process_batches(
                 app.clone(),
                 monitored_txs_sender.clone(),
                 next_batch_notify.clone(),
             )
         };
-        let process_identities_handle = crate::utils::spawn_monitored_with_backoff(
-            process_identities,
+        let process_batches_handle = crate::utils::spawn_monitored_with_backoff(
+            process_batches,
             shutdown_sender.clone(),
-            PROCESS_IDENTITIES_BACKOFF,
+            PROCESS_BATCHES_BACKOFF,
             self.shutdown.clone(),
         );
-        handles.push(process_identities_handle);
+        handles.push(process_batches_handle);
 
         // Monitor transactions
         let app = self.app.clone();
@@ -210,7 +212,7 @@ impl TaskMonitor {
         let monitor_txs_handle = crate::utils::spawn_monitored_with_backoff(
             monitor_txs,
             shutdown_sender.clone(),
-            PROCESS_IDENTITIES_BACKOFF,
+            MONITOR_TXS_BACKOFF,
             self.shutdown.clone(),
         );
         handles.push(monitor_txs_handle);
@@ -218,7 +220,7 @@ impl TaskMonitor {
         // Modify tree
         let app = self.app.clone();
         let sync_tree_notify = base_sync_tree_notify.clone();
-        let tree_synced_notify = base_tree_synced_notify.clone();
+        let tree_synced_notify = base_tree_synced_rx.clone();
 
         let modify_tree = move || {
             tasks::modify_tree::modify_tree(
@@ -238,13 +240,13 @@ impl TaskMonitor {
         // Sync tree state with DB
         let app = self.app.clone();
         let sync_tree_notify = base_sync_tree_notify.clone();
-        let tree_synced_notify = base_tree_synced_notify.clone();
+        let tree_synced_tx = base_tree_synced_tx.clone();
 
         let sync_tree_state_with_db = move || {
             tasks::sync_tree_state_with_db::sync_tree_state_with_db(
                 app.clone(),
                 sync_tree_notify.clone(),
-                tree_synced_notify.clone(),
+                tree_synced_tx.clone(),
             )
         };
         let sync_tree_state_with_db_handle = crate::utils::spawn_monitored_with_backoff(

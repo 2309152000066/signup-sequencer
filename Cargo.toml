@@ -63,7 +63,7 @@ sqlx = { version = "0.7", features = [
 take_mut = "0.2.2"
 tempfile = "3.5.0"
 thiserror = "1.0"
-tokio = { version = "1.17", features = [
+tokio = { version = "1.38", features = [
     "signal",
     "macros",
     "rt",
